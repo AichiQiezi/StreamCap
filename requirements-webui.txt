@@ -1,4 +1,4 @@
 # New web UI (python serve.py) — core recorder deps plus the HTTP/WebSocket server.
 -r requirements.txt
 fastapi>=0.115
-uvicorn[standard]>=0.30
+uvicorn[standard]>=0.54.0
