@@ -139,6 +139,10 @@ def _has_frames(file: str) -> bool:
 class MediaMonitor:
     """Samples size/speed of active recordings and keeps cover thumbnails fresh."""
 
+    # Cover thumbnails each spawn an ffmpeg process; cap them globally so N
+    # simultaneous recordings don't spike the CPU every thumb interval.
+    _thumb_semaphore = asyncio.Semaphore(2)
+
     def __init__(self, services, thumbs_dir: Path, on_change):
         self.services = services
         self.thumbs_dir = thumbs_dir
@@ -146,6 +150,7 @@ class MediaMonitor:
         self.on_change = on_change
         self.stats: dict[str, LiveStats] = {}
         self._task: asyncio.Task | None = None
+        self._pushed: dict[str, tuple] = {}
         # Pre-existing thumbnails survive restarts.
         for thumb in self.thumbs_dir.glob("*.jpg"):
             self.stats.setdefault(thumb.stem, LiveStats()).thumb_version = int(thumb.stat().st_mtime)
@@ -173,41 +178,70 @@ class MediaMonitor:
                 logger.debug(f"media sample failed: {exc}")
             await asyncio.sleep(SAMPLE_INTERVAL)
 
+    def _push_if_changed(self, rec) -> None:
+        """Emit only when something the UI displays actually changed.
+
+        Speed/size move every sample while recording, but idle rooms used to
+        be re-serialized and pushed on every pass too — pure overhead.
+        """
+        st = self.stats[rec.rec_id]
+        snapshot = (
+            st.file,
+            st.size_bytes,
+            round(st.speed_bps),
+            st.width,
+            st.height,
+            st.vcodec,
+            st.thumb_version,
+            bool(rec.is_recording),
+        )
+        if self._pushed.get(rec.rec_id) != snapshot:
+            self._pushed[rec.rec_id] = snapshot
+            self.on_change(rec)
+
+    def forget(self, rec_id: str) -> None:
+        self.stats.pop(rec_id, None)
+        self._pushed.pop(rec_id, None)
+
     async def _sample(self) -> None:
         rm = self.services.recording_manager
+        recs = list(rm.recordings)
+        # Sample rooms concurrently: a slow disk (HDD/NAS) must not delay the rest.
+        await asyncio.gather(*(self._sample_one(rec) for rec in recs))
+
+    async def _sample_one(self, rec) -> None:
         now = time.time()
-        for rec in list(rm.recordings):
-            st = self.get(rec.rec_id)
-            if rec.is_recording and rec.start_time is not None:
-                since = rec.start_time.timestamp() - 5
-                file, total = await asyncio.to_thread(newest_media_file, rec.recording_dir, since, rec.record_format)
-                changed = file != st.file
-                if st._last_t and total >= st._last_size:
-                    inst = (total - st._last_size) / max(now - st._last_t, 0.001)
-                    st.speed_bps = inst if not st.speed_bps else st.speed_bps * 0.6 + inst * 0.4
-                st.file, st.size_bytes, st._last_size, st._last_t = file, total, total, now
-                if file and file != st._probed_file and Path(file).suffix.lower() not in AUDIO_EXTS:
-                    st._probed_file = file
-                    asyncio.create_task(self._probe(rec.rec_id, file))
-                # Only ever read the local file here: some CDNs (e.g. Douyu) hand out single-use
-                # stream URLs, and a second pull on the recorder's URL breaks the recording.
-                due = now - st._thumb_at > THUMB_INTERVAL_RECORDING or changed or not st.thumb_version
-                if file and due and _has_frames(file):
-                    self._refresh_thumb(rec, st, now, file)
-                self.on_change(rec)
-            else:
-                if st.speed_bps or st._last_t:
-                    st.speed_bps, st._last_t, st._last_size = 0.0, 0.0, 0
-                    self.on_change(rec)
-                # Live but deliberately not recorded (notify-only mode): peek at the stream now and then.
-                # Never do this otherwise — the recorder may be about to open this very URL.
-                if (
-                    rec.is_live
-                    and rec.monitor_status
-                    and rec.only_notify_no_record
-                    and now - st._thumb_at > THUMB_INTERVAL_LIVE
-                ):
-                    self._refresh_thumb(rec, st, now, None)
+        st = self.get(rec.rec_id)
+        if rec.is_recording and rec.start_time is not None:
+            since = rec.start_time.timestamp() - 5
+            file, total = await asyncio.to_thread(newest_media_file, rec.recording_dir, since, rec.record_format)
+            changed = file != st.file
+            if st._last_t and total >= st._last_size:
+                inst = (total - st._last_size) / max(now - st._last_t, 0.001)
+                st.speed_bps = inst if not st.speed_bps else st.speed_bps * 0.6 + inst * 0.4
+            st.file, st.size_bytes, st._last_size, st._last_t = file, total, total, now
+            if file and file != st._probed_file and Path(file).suffix.lower() not in AUDIO_EXTS:
+                st._probed_file = file
+                asyncio.create_task(self._probe(rec.rec_id, file))
+            # Only ever read the local file here: some CDNs (e.g. Douyu) hand out single-use
+            # stream URLs, and a second pull on the recorder's URL breaks the recording.
+            due = now - st._thumb_at > THUMB_INTERVAL_RECORDING or changed or not st.thumb_version
+            if file and due and _has_frames(file):
+                self._refresh_thumb(rec, st, now, file)
+            self._push_if_changed(rec)
+        else:
+            if st.speed_bps or st._last_t:
+                st.speed_bps, st._last_t, st._last_size = 0.0, 0.0, 0
+            self._push_if_changed(rec)
+            # Live but deliberately not recorded (notify-only mode): peek at the stream now and then.
+            # Never do this otherwise — the recorder may be about to open this very URL.
+            if (
+                rec.is_live
+                and rec.monitor_status
+                and rec.only_notify_no_record
+                and now - st._thumb_at > THUMB_INTERVAL_LIVE
+            ):
+                self._refresh_thumb(rec, st, now, None)
 
     async def _probe(self, rec_id: str, file: str) -> None:
         await asyncio.sleep(4)  # let the muxer write enough to identify the stream
@@ -227,14 +261,15 @@ class MediaMonitor:
         try:
             dest = self.thumb_path(rec.rec_id)
             ok = False
-            if file and _has_frames(file):
-                ok = await grab_thumbnail(file, dest, from_end=True)
-            if not ok and not rec.is_recording:
-                remote = rec.preview_url or rec.record_url
-                if remote:
-                    ok = await grab_thumbnail(remote, dest, from_end=False)
+            async with MediaMonitor._thumb_semaphore:
+                if file and _has_frames(file):
+                    ok = await grab_thumbnail(file, dest, from_end=True)
+                if not ok and not rec.is_recording:
+                    remote = rec.preview_url or rec.record_url
+                    if remote:
+                        ok = await grab_thumbnail(remote, dest, from_end=False)
             if ok:
                 st.thumb_version = int(time.time())
-                self.on_change(rec)
+            self._push_if_changed(rec)
         finally:
             st._thumb_busy = False

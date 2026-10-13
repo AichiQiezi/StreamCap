@@ -116,6 +116,7 @@ function sections(qualities: { value: string; label: string }[], formats: string
         { key: "folder_name_time", label: "按日期建文件夹", kind: "switch" },
         { key: "folder_name_title", label: "按直播标题建文件夹", kind: "switch" },
         { key: "filename_includes_title", label: "文件名包含直播标题", kind: "switch" },
+        { key: "ascii_save_path", label: "英文路径命名", kind: "switch", hint: "平台用英文标识，主播名和标题转拼音，适合 NAS 和命令行环境" },
         { key: "remove_emojis", label: "去掉名称中的表情符号", kind: "switch" },
       ],
     },

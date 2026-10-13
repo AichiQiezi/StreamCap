@@ -20,8 +20,8 @@ class DirectStreamDownloader:
         save_path: str,
         headers: Optional[dict[str, str]] = None,
         proxy: Optional[str] = None,
-        chunk_size: int = 1024 * 16,
-    ):  # 16KB chunks
+        chunk_size: int = 1024 * 256,
+    ):  # 256KB chunks: fewer syscalls at high bitrates
         self.record_url = record_url
         self.save_path = save_path
         self.headers = headers or {}
@@ -53,8 +53,11 @@ class DirectStreamDownloader:
         try:
             os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
 
+            # Bounded timeouts: an idle connection (no bytes for 120s) is dead
+            # and must fail fast instead of parking the download task forever.
+            timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
             async with httpx.AsyncClient(
-                headers=self.headers, proxy=self.proxy, timeout=None, follow_redirects=True, max_redirects=5
+                headers=self.headers, proxy=self.proxy, timeout=timeout, follow_redirects=True, max_redirects=5
             ) as client:
                 async with client.stream("GET", self.record_url) as response:
                     # Accept 2xx status codes (200, 201, 206, etc.)

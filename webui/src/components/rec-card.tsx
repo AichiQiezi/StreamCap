@@ -22,10 +22,14 @@ export function qualityLabel(q: string) {
 }
 
 export function Cover({ r, compact }: { r: Rec; compact?: boolean }) {
-  const src = thumbUrl(r);
+  // Only live visuals get a real thumbnail: offline/paused cards render the
+  // placeholder, so scrolling a long list doesn't fire thumbnail requests
+  // for rooms that have nothing new to show.
+  const live = r.state === "recording" || r.state === "live";
+  const src = live ? thumbUrl(r) : null;
   const [failed, setFailed] = useState<string | null>(null);
   const color = platformColor(r.platform_key);
-  const dim = !(r.state === "recording" || r.state === "live");
+  const dim = !live;
   if (!src || failed === src)
     return (
       <div
@@ -39,10 +43,12 @@ export function Cover({ r, compact }: { r: Rec; compact?: boolean }) {
     );
   return (
     <>
-      <img src={src} alt="" aria-hidden className="absolute inset-0 size-full scale-125 object-cover opacity-50 blur-xl" />
+      <img src={src} alt="" aria-hidden loading="lazy" decoding="async" className="absolute inset-0 size-full scale-125 object-cover opacity-50 blur-xl" />
       <img
         src={src}
         alt={`${r.name} 画面`}
+        loading="lazy"
+        decoding="async"
         onError={() => setFailed(src)}
         className={cx("absolute inset-0 size-full object-contain transition", dim && "opacity-55 grayscale-[0.6]")}
       />
@@ -85,16 +91,17 @@ export function SelectBox({ checked, onClick, light }: { checked: boolean; onCli
 export const RecCard = memo(function RecCard({ r, selected, onSelect, onEdit, onDelete }: RecItemProps) {
   const res = resolution(r);
   const recording = r.state === "recording";
+  const showCover = r.state === "recording" || r.state === "live";
   return (
     <article
       className={cx(
-        "group relative flex flex-col overflow-hidden rounded-xl border bg-surface shadow-card transition",
+        "group relative flex flex-col overflow-hidden rounded-xl border bg-surface shadow-card transition [content-visibility:auto] [contain-intrinsic-size:auto_340px]",
         selected ? "border-fg/40 ring-1 ring-fg/25" : "border-line hover:border-line-strong",
       )}
     >
       <div className="relative aspect-video overflow-hidden bg-black">
         <Cover r={r} />
-        {thumbUrl(r) && (
+        {showCover && (
           // scrims keep the overlay chips legible on bright frames; placeholders don't need them
           <>
             <div className="pointer-events-none absolute inset-x-0 top-0 h-14 bg-gradient-to-b from-black/45 to-transparent" />

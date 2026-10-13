@@ -7,6 +7,7 @@
     "folder_name_author": true,
     "folder_name_time": false,
     "folder_name_title": false,
+    "ascii_save_path": false,
     "scheduled_shutdown_enabled": false,
     "scheduled_shutdown_time": "23:00",
     "quick_shutdown_hours": "3",

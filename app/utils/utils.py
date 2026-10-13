@@ -254,6 +254,27 @@ def clean_name(input_text, default=None):
     return default
 
 
+def to_ascii_name(input_text, default=None):
+    """Convert a display name to an ASCII-only filesystem slug.
+
+    Chinese characters become pinyin (张三 -> zhangsan); anything else that
+    is not ASCII alphanumeric is replaced with "_". Used for the optional
+    all-English save path. Falls back to clean_name() when pypinyin is missing.
+    """
+    if not input_text or not str(input_text).strip():
+        return default
+    text = str(input_text).strip()
+    try:
+        from pypinyin import lazy_pinyin
+
+        text = "".join(lazy_pinyin(text))
+    except Exception:
+        pass
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text or clean_name(input_text, default)
+
+
 def is_valid_url(url):
     try:
         result = urlparse(url)

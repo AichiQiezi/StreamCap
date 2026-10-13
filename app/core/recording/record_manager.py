@@ -32,6 +32,14 @@ class RecordingManager:
         max_concurrent = int(self.settings.user_config.get("platform_max_concurrent_requests", 3))
         self.platform_semaphores = defaultdict(lambda: asyncio.Semaphore(max_concurrent))
         self.active_recorders = {}
+        # Serialize JSON writes with a minimum gap: bursts of persist calls
+        # (title updates, dir resolution, …) no longer rewrite the whole
+        # file back-to-back, while every caller still gets its data flushed.
+        self._persist_lock = asyncio.Lock()
+        self._persist_done_at = 0.0
+        self._persist_min_gap = 1.0
+        self._disk_check_at = 0.0
+        self._disk_check_ok = True
 
     @property
     def app(self):
@@ -66,6 +74,10 @@ class RecordingManager:
             recording.loop_time_seconds = self.loop_time_seconds
             recording.update_title(self._.get(recording.quality, recording.quality))
             recording.showed_checking_status = True
+        # Rebuild semaphores so a changed platform_max_concurrent_requests
+        # takes effect without restart. In-flight holders keep the old objects.
+        max_concurrent = int(self.settings.user_config.get("platform_max_concurrent_requests", 3))
+        self.platform_semaphores = defaultdict(lambda: asyncio.Semaphore(max_concurrent))
 
     async def add_recording(self, recording):
         with GlobalRecordingState.lock:
@@ -83,9 +95,15 @@ class RecordingManager:
             await self.persist_recordings()
 
     async def persist_recordings(self):
-        """Persist recordings to a JSON file."""
-        data_to_save = [rec.to_dict() for rec in self.recordings]
-        await self.services.config_manager.save_recordings_config(data_to_save)
+        """Persist recordings to a JSON file (writes serialized, min 1s apart)."""
+        async with self._persist_lock:
+            now = asyncio.get_running_loop().time()
+            wait = self._persist_min_gap - (now - self._persist_done_at)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            data_to_save = [rec.to_dict() for rec in self.recordings]
+            await self.services.config_manager.save_recordings_config(data_to_save)
+            self._persist_done_at = asyncio.get_running_loop().time()
 
     async def update_recording_card(self, recording: Recording, updated_info: dict):
         """Update an existing recording object and persist changes to a JSON file."""
@@ -330,11 +348,17 @@ class RecordingManager:
             "video_bitrate": recording.video_bitrate,
         }
 
-        semaphore = self.platform_semaphores[platform_key]
+        semaphore = self.platform_semaphores[platform_key or "custom"]
         recorder = LiveStreamRecorder(self.services, recording, recording_info)
-        async with semaphore:
-            stream_info = await recorder.fetch_stream()
-            logger.info(f"Stream Data: {stream_info}")
+        try:
+            async with semaphore:
+                # A hung platform must not hold its slot forever and starve
+                # the other rooms sharing the per-platform semaphore.
+                stream_info = await asyncio.wait_for(recorder.fetch_stream(), timeout=120)
+        except asyncio.TimeoutError:
+            logger.error(f"Fetch stream data timed out (120s): {recording.url}")
+            stream_info = None
+        logger.info(f"Stream Data: {stream_info}")
         if not stream_info or not stream_info.anchor_name:
             logger.error(f"Fetch stream data failed: {recording.url}")
             recording.is_checking = False
@@ -494,6 +518,12 @@ class RecordingManager:
         await self.remove_recordings(recordings)
 
     async def check_free_space(self, output_dir: str | None = None):
+        # disk_usage is a blocking syscall; cache the verdict briefly so N
+        # rooms checked in one round share a single measurement.
+        now = asyncio.get_running_loop().time()
+        if now - self._disk_check_at < 30:
+            self.services.recording_enabled = self._disk_check_ok
+            return
         disk_space_limit = float(self.settings.user_config.get("recording_space_threshold") or 0)
         output_dir = output_dir or self.settings.get_video_save_path()
         if utils.check_disk_capacity(output_dir) < disk_space_limit:
@@ -504,9 +534,13 @@ class RecordingManager:
                 duration=86400,
                 show_close_icon=True,
             )
-
+            self._disk_check_ok = False
         else:
+            if not self.services.recording_enabled:
+                logger.info("Disk space recovered, recording function re-enabled")
             self.services.recording_enabled = True
+            self._disk_check_ok = True
+        self._disk_check_at = now
 
     @staticmethod
     async def get_scheduled_time_range(scheduled_start_time, monitor_hours) -> list | None:

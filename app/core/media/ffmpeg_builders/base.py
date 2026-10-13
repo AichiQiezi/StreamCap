@@ -2,16 +2,16 @@ import abc
 
 DEFAULT_CONFIG = {
     "rw_timeout": "15000000",
-    "analyzeduration": "20000000",
-    "probesize": "10000000",
+    "analyzeduration": "10000000",
+    "probesize": "5000000",
     "bufsize": "8000k",
     "max_muxing_queue_size": "1024",
 }
 
 OVERSEAS_CONFIG = {
     "rw_timeout": "50000000",
-    "analyzeduration": "40000000",
-    "probesize": "20000000",
+    "analyzeduration": "20000000",
+    "probesize": "10000000",
     "bufsize": "15000k",
     "max_muxing_queue_size": "2048",
 }
@@ -82,11 +82,17 @@ class FFmpegCommandBuilder(abc.ABC):
             # FFmpeg 8 rejects container/extension mismatches in strict mode.
             hls_input_options = ["-extension_picky", "0"]
 
+        # Everything before "-i" is an input option. In particular the
+        # reconnect flags only take effect here, and they are a no-op
+        # without the "-reconnect 1" master switch.
         # fmt: off
         command = [
             "ffmpeg",
             "-y",
-            "-v", "verbose",
+        ]
+        if self.proxy:
+            command += ["-http_proxy", self.proxy]
+        command += [
             "-rw_timeout", config["rw_timeout"],
             "-loglevel", "error",
             "-hide_banner",
@@ -97,28 +103,28 @@ class FFmpegCommandBuilder(abc.ABC):
             "-probesize", config["probesize"],
             "-fflags", "+discardcorrupt+igndts",
             "-re",
+            "-reconnect", "1",
+            "-reconnect_delay_max", "30",
+            "-reconnect_streamed", "1",
+            # NOTE: no "-reconnect_at_eof" on purpose. A clean end-of-stream
+            # must let ffmpeg exit so the recorder finishes and the room is
+            # re-checked; retrying EOF hangs the recording forever on ended
+            # streams. Transient failures are still retried via -reconnect.
             *hls_input_options,
+        ]
+        if self.headers:
+            command += ["-headers", self.headers]
+        command += [
             "-i", self.record_url,
             "-bufsize", config["bufsize"],
             "-sn",
             "-dn",
-            "-reconnect_delay_max", "60",
-            "-reconnect_streamed",
-            "-reconnect_at_eof",
             "-max_muxing_queue_size", config["max_muxing_queue_size"],
             "-correct_ts_overflow", "1",
             "-avoid_negative_ts", "1",
             "-flush_packets", "1"
         ]
         # fmt: on
-
-        if self.headers:
-            command.insert(11, "-headers")
-            command.insert(12, self.headers)
-
-        if self.proxy:
-            command.insert(1, "-http_proxy")
-            command.insert(2, self.proxy)
 
         return command
 

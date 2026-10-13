@@ -31,7 +31,13 @@ export function LibraryPage() {
       .map((r) => r.stats.file!.replace(/\\/g, "/"))
       .join("\n"),
   );
-  const isActive = (f: MediaFile) => activeFiles.split("\n").some((a) => a && a.endsWith(`/${f.path}`));
+  const activeSet = useMemo(() => {
+    const act = activeFiles.split("\n").filter(Boolean);
+    const m = new Map<string, boolean>();
+    (files ?? []).forEach((f) => m.set(f.path, act.some((a) => a.endsWith(`/${f.path}`))));
+    return m;
+  }, [files, activeFiles]);
+  const isActive = (f: MediaFile) => activeSet.get(f.path) ?? false;
 
   const load = useCallback(async () => {
     setLoading(true);

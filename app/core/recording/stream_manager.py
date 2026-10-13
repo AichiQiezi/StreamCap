@@ -21,6 +21,26 @@ from ..runtime.process_manager import BackgroundService
 T = TypeVar("T")
 
 
+def _output_file_size(save_file_path: str) -> int:
+    """Current on-disk size of the recording output.
+
+    Segmented recordings use a printf pattern (…_%03d.ts); sum the matching
+    segment files instead of stating the pattern itself.
+    """
+    try:
+        if "%" in os.path.basename(save_file_path):
+            directory = os.path.dirname(save_file_path)
+            prefix = os.path.basename(save_file_path).split("%")[0]
+            return sum(
+                os.path.getsize(os.path.join(directory, name))
+                for name in os.listdir(directory)
+                if name.startswith(prefix)
+            )
+        return os.path.getsize(save_file_path)
+    except OSError:
+        return 0
+
+
 class LiveStreamRecorder:
     DEFAULT_SEGMENT_TIME = "1800"
     DEFAULT_SAVE_FORMAT = "mp4"
@@ -97,7 +117,12 @@ class LiveStreamRecorder:
             filename = filename.replace("{anchor_name}", stream_info.anchor_name or "")
             filename = filename.replace("{title}", live_title or "")
             filename = filename.replace("{time}", now)
-            filename = filename.replace("{platform}", stream_info.platform or "")
+            platform_name = (
+                self.recording.platform_key
+                if self.user_config.get("ascii_save_path") and self.recording.platform_key
+                else stream_info.platform
+            )
+            filename = filename.replace("{platform}", platform_name or "")
 
             while "__" in filename:
                 filename = filename.replace("__", "_")
@@ -111,6 +136,8 @@ class LiveStreamRecorder:
         else:
             full_filename = "_".join(i for i in (stream_info.anchor_name, live_title, now) if isinstance(i, str))
 
+        if self.user_config.get("ascii_save_path"):
+            full_filename = utils.to_ascii_name(full_filename) or full_filename
         return full_filename
 
     def _get_output_dir(self, stream_info: StreamData) -> str:
@@ -124,16 +151,23 @@ class LiveStreamRecorder:
 
         now = datetime.today().strftime("%Y-%m-%d_%H-%M-%S")
         output_dir = self.output_dir.rstrip("/").rstrip("\\")
+        ascii_path = bool(self.user_config.get("ascii_save_path"))
         if self.user_config.get("folder_name_platform"):
-            output_dir = os.path.join(output_dir, stream_info.platform)
+            platform_dir = self.recording.platform_key if ascii_path and self.recording.platform_key else stream_info.platform
+            output_dir = os.path.join(output_dir, platform_dir)
         if self.user_config.get("folder_name_author"):
-            output_dir = os.path.join(output_dir, stream_info.anchor_name)
+            anchor = utils.to_ascii_name(stream_info.anchor_name) if ascii_path else stream_info.anchor_name
+            output_dir = os.path.join(output_dir, anchor)
         if self.user_config.get("folder_name_time"):
             output_dir = os.path.join(output_dir, now[:10])
         if self.user_config.get("folder_name_title") and stream_info.title:
             live_title = self._clean_and_truncate_title(stream_info.title)
+            anchor_dir = stream_info.anchor_name
+            if ascii_path:
+                live_title = utils.to_ascii_name(live_title)
+                anchor_dir = utils.to_ascii_name(stream_info.anchor_name)
             if self.user_config.get("folder_name_time"):
-                output_dir = os.path.join(output_dir, f"{live_title}_{stream_info.anchor_name}")
+                output_dir = os.path.join(output_dir, f"{live_title}_{anchor_dir}")
             else:
                 output_dir = os.path.join(output_dir, f"{now[:10]}_{live_title}")
         os.makedirs(output_dir, exist_ok=True)
@@ -340,7 +374,10 @@ class LiveStreamRecorder:
             logger.error(f"Failed to remove recorder instance: {e}")
 
     async def recheck_live_status(self):
-        if not self.should_stop:
+        # A watchdog stop is not a manual stop: the stream may have resumed,
+        # so re-check promptly instead of waiting for the next interval.
+        if not self.should_stop or getattr(self, "watchdog_triggered", False):
+            self.watchdog_triggered = False
             # not manually stopped
             recording_duration = time.time() - self.recording_start_time
             if recording_duration > self.min_valid_recording_duration:
@@ -348,6 +385,13 @@ class LiveStreamRecorder:
                     self.services.run_coro(self.services.recording_manager.check_if_live(self.recording))
             else:
                 self.recording.status_info = RecordingStatus.RECORDING_ERROR
+
+    @staticmethod
+    def _output_stalled(save_file_path: str, last_size: int, stall_since: float, timeout: float) -> bool:
+        """True when the output file stopped growing for longer than timeout."""
+        if _output_file_size(save_file_path) != last_size:
+            return False
+        return time.time() - stall_since >= timeout
 
     @staticmethod
     async def _capture_stream_tail(
@@ -402,6 +446,15 @@ class LiveStreamRecorder:
             logger.log("STREAM", f"Recording Stream URL: {record_url}")
             self.recording_start_time = time.time()
 
+            # Stall watchdog: a dead-but-not-closed stream (half-open TCP,
+            # endlessly retried 404s, …) keeps ffmpeg alive with zero output
+            # while every live re-check is skipped as "recording is busy".
+            # If nothing lands on disk for this long, stop gracefully so the
+            # recorder finishes and the room is re-checked.
+            stall_timeout = 90.0
+            last_output_size = -1
+            stall_since = time.time()
+
             while True:
                 if self.should_stop or self.recording.force_stop or not self.services.recording_enabled:
                     logger.info(f"Preparing to End Recording: {live_url}")
@@ -437,6 +490,18 @@ class LiveStreamRecorder:
                     await self.remove_active_recorder()
                     self.recording.is_recording = False
                     break
+
+                if self._output_stalled(save_file_path, last_output_size, stall_since, stall_timeout):
+                    logger.warning(
+                        f"No data written for {stall_timeout:.0f}s, stopping stalled recording: {live_url}"
+                    )
+                    self.should_stop = True
+                    self.watchdog_triggered = True
+                else:
+                    current_size = _output_file_size(save_file_path)
+                    if current_size != last_output_size:
+                        last_output_size = current_size
+                        stall_since = time.time()
 
                 await asyncio.sleep(1)
 

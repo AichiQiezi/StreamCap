@@ -38,6 +38,7 @@ EDITABLE_SETTINGS = {
     "folder_name_author",
     "folder_name_time",
     "folder_name_title",
+    "ascii_save_path",
     "enable_proxy",
     "proxy_address",
     "default_platform_with_proxy",
@@ -348,7 +349,7 @@ def create_app(services, static_dir: Path | None, cache_dir: Path, allowed_hosts
         await on_backend(rm.delete_recording_cards(recs))
         for rec in recs:
             state["media"].thumb_path(rec.rec_id).unlink(missing_ok=True)
-            state["media"].stats.pop(rec.rec_id, None)
+            state["media"].forget(rec.rec_id)
 
     @app.post("/api/recordings/{rec_id}/monitor")
     async def set_monitor(rec_id: str, on: Annotated[bool, Body(embed=True)]):
