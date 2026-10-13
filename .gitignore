@@ -177,3 +177,9 @@ backup_config/
 ffmpeg.exe
 ffplay.exe
 ffprobe.exe
+
+# web UI
+webui/node_modules/
+webui/dist/
+cache/
+webui/*.tsbuildinfo
