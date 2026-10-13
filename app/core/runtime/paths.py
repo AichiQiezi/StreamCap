@@ -96,3 +96,14 @@ def prepend_user_bin_dirs() -> None:
     for directory in (user_data_dir / "ffmpeg", user_data_dir / "node"):
         if directory.is_dir():
             os.environ["PATH"] = str(directory) + os.pathsep + os.environ.get("PATH", "")
+
+
+def ffmpeg_executable() -> str:
+    """Absolute ffmpeg path, preferring PATH and falling back to the bundle dir."""
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    bundled = user_data_dir / "ffmpeg" / f"ffmpeg{EXECUTABLE_SUFFIX}"
+    if bundled.is_file():
+        return str(bundled)
+    return "ffmpeg"

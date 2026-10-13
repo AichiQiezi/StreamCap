@@ -532,7 +532,12 @@ def create_app(services, static_dir: Path | None, cache_dir: Path, allowed_hosts
 
     @app.post("/api/files/reveal")
     async def reveal_file(path: str = Query("")):
-        target = resolve_file(path).parent if path else save_root()
+        if path:
+            full = resolve_file(path)
+            if not await asyncio.to_thread(utils.reveal_in_folder, str(full)):
+                raise HTTPException(500, "无法打开文件夹")
+            return {"ok": True}
+        target = save_root()
         if not await asyncio.to_thread(utils.open_folder, str(target)):
             raise HTTPException(500, "无法打开文件夹")
         return {"ok": True}

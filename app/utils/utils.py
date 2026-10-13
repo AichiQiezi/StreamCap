@@ -9,6 +9,7 @@ import shutil
 import string
 import subprocess
 import sys
+import time as _time
 import traceback
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -176,10 +177,78 @@ def jsonp_to_json(jsonp_str: str) -> OptionalDict:
         raise Exception("No JSON data found in JSONP response.")
 
 
+def _bring_explorer_to_front(directory_path: str) -> None:
+    """Bring the Explorer window for directory_path to the foreground.
+
+    os.startfile opens the window but a background process cannot steal focus,
+    so the folder silently ends up behind the browser. The AttachThreadInput
+    trick bypasses the foreground lock. stdlib ctypes only.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        target = os.path.normcase(os.path.abspath(directory_path))
+        base = os.path.basename(target.rstrip(os.sep)) or target
+        found = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        def _enum(hwnd, _param):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            cls = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, cls, 256)
+            if cls.value != "CabinetWClass":
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            if buf.value.lower() == base.lower():
+                found.append(hwnd)
+            return True
+
+        user32.EnumWindows(_enum, 0)
+        if not found:
+            return
+        hwnd = found[0]
+        fore_tid = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
+        cur_tid = user32.GetCurrentThreadId()
+        user32.AttachThreadInput(cur_tid, fore_tid, True)
+        try:
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+            user32.BringWindowToTop(hwnd)
+        finally:
+            user32.AttachThreadInput(cur_tid, fore_tid, False)
+    except Exception as e:
+        logger.debug(f"Bring explorer window to front failed: {e}")
+
+
+def reveal_in_folder(file_path: str) -> bool:
+    """Open the containing folder with the file selected (Windows only helper)."""
+    try:
+        if sys.platform == "win32":
+            target = os.path.abspath(file_path)
+            subprocess.Popen(["explorer", f"/select,{target}"])
+            # /select reuses an existing window for the folder without
+            # focusing it; bring it forward explicitly.
+            _time.sleep(0.8)
+            _bring_explorer_to_front(os.path.dirname(target))
+            return True
+    except Exception as e:
+        logger.error(f"Failed to reveal file '{file_path}': {e}")
+    return False
+
+
 def open_folder(directory_path: str) -> bool:
     try:
         if sys.platform == "win32":
+            # Fresh installs may not have the save root yet; startfile on a
+            # missing path raises FileNotFoundError and nothing opens.
+            os.makedirs(directory_path, exist_ok=True)
             os.startfile(directory_path)
+            _bring_explorer_to_front(directory_path)
         elif sys.platform == "darwin":
             subprocess.run(["open", directory_path], check=True)
         else:

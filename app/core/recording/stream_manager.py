@@ -16,6 +16,7 @@ from ..media import ffmpeg_builders
 from ..media.direct_downloader import DirectStreamDownloader
 from ..platforms import platform_handlers
 from ..platforms.platform_handlers import StreamData
+from ..runtime.paths import ffmpeg_executable
 from ..runtime.process_manager import BackgroundService
 
 T = TypeVar("T")
@@ -618,7 +619,7 @@ class LiveStreamRecorder:
             if os.path.exists(converts_file_path) and os.path.getsize(converts_file_path) > 0:
                 save_path = converts_file_path.rsplit(".", maxsplit=1)[0] + ".mp4"
                 ffmpeg_command = [
-                    "ffmpeg",
+                    ffmpeg_executable(),
                     "-i",
                     converts_file_path,
                     "-c:v",
